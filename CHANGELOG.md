@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-11-20
+
 ### Changed
 - Updated for OMP 19.0.1; development and CI now run against it.
 - On a Claude plan, the bridge still turns OMP's "stop" warming decision into a
