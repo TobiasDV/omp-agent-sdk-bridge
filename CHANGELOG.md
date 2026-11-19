@@ -18,6 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   results until 5 seconds after such a response started; the hold is recorded as
   `heldMs` in the usage ledger. A miss of this kind is reported with its timing
   instead of as "unexplained".
+- Overlapping subagent loads no longer remove `claude-bridge` from the shared
+  OMP model registry and leave the parent reporting a missing API key. Each load
+  registers the provider while preserving the active stream callback.
 
 ## [0.11.2] - 2026-11-14
 
