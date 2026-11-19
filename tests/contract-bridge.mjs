@@ -2,6 +2,7 @@
 // The SDK query boundary is replaced so these never contact Anthropic or spend usage.
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { mock } from "bun:test";
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -34,14 +35,27 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 	},
 }));
 const { default: extension, __test } = await import("../src/index.ts");
-const registered = {};
-const tools = {};
-await extension({
-	on() {}, registerCommand() {},
-	registerTool(tool) { tools[tool.name] = tool; },
-	registerProvider(_id, provider) { Object.assign(registered, provider); },
-});
-const model = { ...registered.models[0], provider: "claude-bridge", api: "claude-bridge" };
+const { AuthStorage, streamSimple } = await import("@oh-my-pi/pi-ai");
+const { ModelRegistry } = await import("@oh-my-pi/pi-coding-agent/config/model-registry");
+const { bindPreparedExtensions } = await import("@oh-my-pi/pi-coding-agent/extensibility/extensions/loader");
+const auth = await AuthStorage.create(join(agentDir, "bridge", "agent.db"));
+const registry = new ModelRegistry(auth, join(agentDir, "bridge", "models.yml"));
+const source = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+const prepared = [{ path: source, resolvedPath: source, factory: extension, error: null }];
+const bind = () => bindPreparedExtensions(prepared, join(agentDir, "bridge"));
+function applyExtensionProviders({ extensions, runtime, errors }) {
+	assert.deepEqual(errors, []);
+	// OMP clears registrations for the loaded paths before replaying each load's queue.
+	registry.clearSourceRegistrations(extensions.map(({ path }) => path));
+	for (const { name, config, sourceId } of runtime.pendingProviderRegistrations) {
+		registry.registerProvider(name, config, sourceId);
+	}
+}
+const parent = await bind();
+applyExtensionProviders(parent);
+const registered = parent.runtime.pendingProviderRegistrations.find(({ name }) => name === "claude-bridge").config;
+const model = registry.find("claude-bridge", "claude-haiku-5-5");
+assert.ok(model, "parent can find its Claude model before subagent setup");
 const success = (text) => ({ type: "result", subtype: "success", result: text, usage: { input_tokens: 1, output_tokens: 1 } });
 const assistant = (text) => ({ type: "assistant", message: { content: [{ type: "text", text }] } });
 const overage = { type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", isUsingOverage: true } };
@@ -57,6 +71,27 @@ async function run(batch, ctx = context, options = {}) {
 	await new Promise(setImmediate);
 	return result;
 }
+async function expectRegisteredAnswer(label, selectedModel) {
+	const apiKey = await registry.getApiKey(selectedModel);
+	assert.ok(apiKey, `${label} can resolve the bridge credential`);
+	messages = [success(label)];
+	const answer = await streamSimple(selectedModel, { ...context, tools: [] }, { apiKey, sessionId: label }).result();
+	assert.equal(answer.content[0]?.text, label);
+}
+
+// Bind both children while the parent registration is still active, before any
+// session_start. This exercises the reported overlap without racing a timer.
+const children = await Promise.all([bind(), bind()]);
+for (const [i, child] of children.entries()) {
+	applyExtensionProviders(child);
+	const label = `subagent ${i + 1}`;
+	const selectedModel = registry.find(model.provider, model.id);
+	assert.ok(selectedModel, `${label} can find the shared Claude model`);
+	await expectRegisteredAnswer(label, selectedModel);
+}
+await expectRegisteredAnswer("parent", model);
+console.log("ok   overlapping subagent loads preserve Claude provider access for both children and parent");
+
 const fallback = await run([assistant("ONE ANSWER"), success("ONE ANSWER")]);
 assert.equal(fallback.content.map((block) => block.text ?? "").join(""), "ONE ANSWER");
 console.log("ok   completed assistant + result fallback emits the answer once");
@@ -111,7 +146,7 @@ assert.equal(warmEmpty.stopReason, "error");
 assert.match(warmEmpty.errorMessage, /cache-refresh usage/);
 console.log("ok   cache refresh propagates SDK failure, overage and absent usage");
 
-const ask = tools.AskClaude;
+const ask = parent.extensions[0].tools.get("AskClaude").definition;
 assert.equal(ask.approval, "read");
 const askContext = {
 	cwd: process.env.PI_CODING_AGENT_DIR,
@@ -223,3 +258,4 @@ console.log("ok   non-isolated delegations select separate mirrors for distinct 
 	}
 }
 console.log("ok   tool results wait for a large cache write to be readable; an ended query receives nothing");
+auth.close();
