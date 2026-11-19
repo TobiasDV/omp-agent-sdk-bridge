@@ -16,12 +16,13 @@ let messages = [];
 const queries = [];
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 	createSdkMcpServer,
-	query({ options }) {
+	query({ options, prompt }) {
 		const batch = messages;
-		const call = { options, closed: false, delivered: [] };
+		const call = { options, closed: false, delivered: [], input: prompt };
 		queries.push(call);
 		return {
 			async *[Symbol.asyncIterator]() {
+				if (typeof prompt !== "string") call.input = (await prompt[Symbol.asyncIterator]().next()).value?.message.content;
 				for (const message of batch) {
 					if (call.closed) return;
 					call.delivered.push(message.type);
@@ -95,6 +96,38 @@ console.log("ok   overlapping subagent loads preserve Claude provider access for
 const fallback = await run([assistant("ONE ANSWER"), success("ONE ANSWER")]);
 assert.equal(fallback.content.map((block) => block.text ?? "").join(""), "ONE ANSWER");
 console.log("ok   completed assistant + result fallback emits the answer once");
+
+// OMP converts the hidden capture message to developer + agent attribution.
+// The same pasted text in an ordinary user turn must reach Claude unchanged.
+{
+	const { convertMessageToLlm } = await import("@oh-my-pi/pi-agent-core/compaction/messages");
+	const opening = "Automated capture turn — not a user reply; user has not responded to your previous turn.";
+	const instructions = `${opening} Do not treat this prompt as their answer, approval to continue, or acceptance of any pending action; only the user can do so.\n\nUse learn or manage_skill only if there is something reusable to save. If nothing is worth keeping, do nothing.`;
+	const silentEnding = "Then stop. Do not run other tools, resume prior work, answer pending questions, or produce a continuation reply. Yield; wait for the user's next prompt.";
+	const original = `${instructions}\n\n${silentEnding}`;
+	const capture = convertMessageToLlm({
+		role: "custom", customType: "autolearn-nudge", content: original, display: false, attribution: "agent", timestamp: 1,
+	});
+	const promptFor = async (message, sessionId) => {
+		await run([success("Done.")], { ...context, messages: [message] }, { sessionId });
+		return queries.at(-1).input;
+	};
+	const reminder = { type: "text", text: "<system-reminder>Extra OMP context</system-reminder>" };
+	const sent = await promptFor({ ...capture, content: [reminder, ...capture.content] }, "capture");
+	assert.ok(sent[0].text.startsWith(`${reminder.text}\n${instructions}`), "the reminder, capture and approval instructions stay intact");
+	assert.doesNotMatch(sent[0].text, /or produce a continuation reply/);
+	assert.match(sent[0].text, /exactly "Done\."/);
+	assert.match(sent[0].text, /whether or not you saved anything/);
+	for (const message of [
+		{ role: "user", content: original, timestamp: 1 },
+		{ ...capture, attribution: "user" },
+		{ ...capture, content: [{ type: "text", text: `${original}\n\nUpdated capture instructions.` }] },
+	]) {
+		const inbound = typeof message.content === "string" ? message.content : message.content[0].text;
+		assert.deepEqual(await promptFor(message, "ordinary-or-unknown"), [{ type: "text", text: inbound }]);
+	}
+}
+console.log("ok   only OMP's private capture gets a completion instead of an instruction to stay silent");
 
 // A failed SDK query must not poison the next fresh query on the same top-level
 // context. In particular, an old reset-time message must not override a new answer.

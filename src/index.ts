@@ -330,12 +330,25 @@ function extractAllToolResults(context: Context): McpResult[] {
 	return results;
 }
 
+const CAPTURE_OPENING = "Automated capture turn — not a user reply; user has not responded to your previous turn.";
+const CAPTURE_SILENT_ENDING = "Then stop. Do not run other tools, resume prior work, answer pending questions, or produce a continuation reply. Yield; wait for the user's next prompt.";
+const CAPTURE_COMPLETION = 'Do not run other tools, resume prior work, or answer pending questions. Then finish this private capture with exactly "Done." as the entire reply, whether or not you saved anything.';
+
 /** Extract the last user message from context as a prompt string. Returns null if last message is not a user message. */
 function extractUserPrompt(messages: Context["messages"]): string | null {
 	const last = messages[messages.length - 1];
 	if (!last || (last.role !== "user" && last.role !== "developer")) return null;
 	if (typeof last.content === "string") return last.content;
-	return messageContentToText(last.content) || "";
+	const text = messageContentToText(last.content);
+	// OMP's hidden Auto-Learn message loses its custom type before reaching the provider,
+	// but retains developer role and agent attribution. Match the known prompt's opening
+	// and ending as well so user messages and future capture formats pass through.
+	// Without a private acknowledgment, Claude Code may retry a thinking-only completion.
+	if (last.role !== "developer" || last.attribution !== "agent" || !text.endsWith(CAPTURE_SILENT_ENDING)) return text;
+	const isCapture = last.content.some((block) =>
+		block.type === "text" && block.text.startsWith(CAPTURE_OPENING) && block.text.endsWith(CAPTURE_SILENT_ENDING),
+	);
+	return isCapture ? text.slice(0, -CAPTURE_SILENT_ENDING.length) + CAPTURE_COMPLETION : text;
 }
 
 /** Extract the last user message as ContentBlockParam[] (preserving images).

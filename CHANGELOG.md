@@ -15,6 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   notice instead of garbled text.
 
 ### Fixed
+- OMP's private Auto-Learn capture asks for a short acknowledgment on Claude
+  instead of silence, so Claude Code does not need to retry a thinking-only
+  response. Normal prompts and capture tool permissions are unchanged.
 - A failed Claude query no longer poisons later queries in the same OMP process.
   Fresh queries clear the previous SDK error and Extra Usage stop flag, so a
   successful request after a limit reset does not fail with the old reset-time
