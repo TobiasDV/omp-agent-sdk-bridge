@@ -2,7 +2,7 @@
 // Extracted so they can be tested without pulling in the full extension runtime.
 
 import type { Message as PiMessage } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
-import type { Message as SessionMessage } from "cc-session-io";
+import type { Message as SessionMessage, ToolResultBlock } from "cc-session-io";
 import { pascalCase } from "change-case";
 
 export const PROVIDER_ID = "claude-bridge";
@@ -49,8 +49,10 @@ export function convertPiMessages(
 	messages: PiMessage[],
 	customToolNameToSdk?: Map<string, string>,
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string> } {
-	const anthropicMessages = [];
+	const anthropicMessages: SessionMessage[] = [];
 	const sanitizedIds = new Map();
+	let afterAssistant = 0;
+	let toolResults: ToolResultBlock[] | undefined;
 
 	for (const msg of messages) {
 		// OMP 18 "developer" messages (auto-continue, injected notes) have no Claude Code
@@ -89,6 +91,8 @@ export function convertPiMessages(
 			}
 			if (!blocks.length) blocks.push({ type: "text", text: "[incompatible content omitted]" });
 			anthropicMessages.push({ role: "assistant", content: blocks });
+			afterAssistant = anthropicMessages.length;
+			toolResults = undefined;
 		} else if (msg.role === "toolResult") {
 			const blocks = [];
 			if (Array.isArray(msg.content)) {
@@ -101,10 +105,15 @@ export function convertPiMessages(
 			}
 			const content = blocks.some((block) => block.type === "image") ? blocks
 				: typeof msg.content === "string" ? msg.content : messageContentToText(msg.content);
-			anthropicMessages.push({
-				role: "user",
-				content: [{ type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: content || "", is_error: msg.isError }],
-			});
+			// Claude expects all results for a parallel tool call in one user
+			// message, before any user steering that arrived during the tools.
+			if (!toolResults) {
+				toolResults = [];
+				const userMessage: SessionMessage = { role: "user", content: toolResults };
+				if (afterAssistant === anthropicMessages.length) anthropicMessages.push(userMessage);
+				else anthropicMessages.splice(afterAssistant, 0, userMessage);
+			}
+			toolResults.push({ type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: content || "", is_error: msg.isError });
 		}
 	}
 

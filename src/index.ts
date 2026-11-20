@@ -4,7 +4,7 @@ import { type ExtensionAPI, type ExtensionUIContext } from "@oh-my-pi/pi-coding-
 import { createModelManager } from "@oh-my-pi/pi-catalog";
 import { anthropicModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
-import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type Query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@oh-my-pi/pi-tui";
 import { getAgentDir, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
@@ -491,12 +491,12 @@ async function runCacheWarm(
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
 	const recipe = warmRecipes.get(sessionKey);
-	const sessionId = sessionSlot(sessionKey).s?.sessionId;
+	const state = sessionSlot(sessionKey).s;
 	const output = newAssistantOutput(model, "", "stop");
 	let sdkQuery: ReturnType<typeof query> | undefined;
 	const onAbort = () => { try { sdkQuery?.close(); } catch {} };
 	try {
-		if (!recipe || !sessionId) throw new Error("claude-bridge: nothing to keep warm");
+		if (!recipe || !state?.completed || state.needsRebuild) throw new Error("claude-bridge: nothing to keep warm");
 		const { extraArgs = {}, ...base } = recipe.options;
 		const { "replay-user-messages": _replay, ...warmArgs } = extraArgs;
 		const mcpServers = buildMcpServers(recipe.mcpTools, new QueryContext());
@@ -506,7 +506,7 @@ async function runCacheWarm(
 				...base,
 				extraArgs: warmArgs,
 				...(mcpServers ? { mcpServers } : {}),
-				resume: sessionId,
+				resume: state.sessionId,
 				forkSession: true,
 				persistSession: false,
 				maxTurns: 1,
@@ -549,7 +549,7 @@ async function runCacheWarm(
 		}
 		if (options?.signal?.aborted) throw new Error("Operation aborted");
 		if (!receivedUsage) throw new Error("Claude Code returned no cache-refresh usage");
-		debug(`cache-warm: session=${sessionId.slice(0, 8)} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite}`);
+		debug(`cache-warm: session=${state.sessionId.slice(0, 8)} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite}`);
 		stream.push({ type: "start", partial: output });
 		stream.push({ type: "done", reason: "stop", message: output });
 	} catch (e) {
@@ -845,9 +845,14 @@ function syncSharedSession(
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 	key: string = DEFAULT_SESSION_KEY,
+	replaceActiveQuery = false,
 ): SyncResult {
 	const slot = sessionSlot(key);
-	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
+	const last = messages[messages.length - 1];
+	// When a tool closes a compacted turn, even its final result belongs in the
+	// replacement mirror. A last user/developer message is still the SDK prompt.
+	const priorMessages = replaceActiveQuery && last?.role !== "user" && last?.role !== "developer"
+		? messages : messages.slice(0, -1);
 
 	// REUSE path
 	//
@@ -856,7 +861,7 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (slot.s && !slot.s.needsRebuild && priorMessages.length >= slot.s.cursor) {
+	if (!replaceActiveQuery && slot.s && !slot.s.needsRebuild && priorMessages.length >= slot.s.cursor) {
 		const missed = priorMessages.slice(slot.s.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -874,7 +879,7 @@ function syncSharedSession(
 	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
 	// slot.s before the next syncSharedSession call. In practice this
 	// fires only for isolated compact-summary subprocesses.
-	if (slot.s && !slot.s.needsRebuild && priorMessages.length < slot.s.cursor) {
+	if (!replaceActiveQuery && slot.s && !slot.s.needsRebuild && priorMessages.length < slot.s.cursor) {
 		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${slot.s.sessionId.slice(0, 8)}, cursor=${slot.s.cursor}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${slot.s.sessionId} cursor=${slot.s.cursor}`);
 		return { sessionId: null, path: "clean-start", preserveSharedSession: true };
@@ -882,13 +887,14 @@ function syncSharedSession(
 
 	// EXTEND path: OMP's history before `cursor` is unchanged (no compaction or
 	// tree move), so keep CC's own records for it and convert only the rest.
-	if (slot.s && priorMessages.length >= slot.s.cursor) {
+	if (!replaceActiveQuery && slot.s && priorMessages.length >= slot.s.cursor) {
 		const extended = extendCleanSession(slot, priorMessages, cwd, customToolNameToSdk);
 		if (extended) return extended;
 	}
 
 	// REBUILD path
-	const stableId = key === DEFAULT_SESSION_KEY ? undefined : mirrorIdFor(key);
+	// A closing SDK process may still append to the old mirror.
+	const stableId = replaceActiveQuery || key === DEFAULT_SESSION_KEY ? undefined : mirrorIdFor(key);
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${messages.length} total messages`);
 		debug(`syncResult: path=clean-start${stableId ? ` stableId=${stableId.slice(0, 8)}` : ""}`);
@@ -900,7 +906,7 @@ function syncSharedSession(
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
 	// and for any tools that key off them. Skipped only when there's a
 	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !slot.s?.forceRotate;
+	const preserveId = previousSessionId !== undefined && !slot.s?.forceRotate && !replaceActiveQuery;
 	// No mirror yet in this process (e.g. OMP restarted): reuse the OMP session's
 	// stable id, overwriting its old mirror rather than adding another file.
 	const targetId = preserveId ? previousSessionId : slot.s?.forceRotate ? undefined : stableId;
@@ -1456,6 +1462,16 @@ const EXTRA_USAGE_STOP_MESSAGE =
 	"The bridge stops here so nothing more is charged. Wait for the limit to reset, or set " +
 	'"provider.allowExtraUsage": true in claude-bridge.json to continue on Extra Usage.';
 
+function newestHistoryRewrite(messages: Context["messages"]): number {
+	let newest = 0;
+	for (const message of messages) {
+		if (message.role === "user" && message.historyRewriteAt !== undefined) {
+			newest = Math.max(newest, message.historyRewriteAt, message.timestamp);
+		}
+	}
+	return newest;
+}
+
 /** Messages OMP appended after this turn's tool results (steers), as content blocks. */
 function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
 	let i = messages.length;
@@ -1564,6 +1580,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const activeQuery = ctx().activeQuery !== null;
 	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
 	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
+	// OMP carries this stamp on its normalized compaction summary. Read the actual
+	// provider context: an extension event may not have run yet, or may belong to
+	// another session. Keeping the old SDK query would ignore the summary entirely.
+	const historyRewriteAt = newestHistoryRewrite(context.messages);
+	const replacement = resultCtx && historyRewriteAt > resultCtx.historyRewriteAt ? resultCtx.retire : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
 		debug(`provider: active query user-only call treated as reentrant fresh query, waitingHandlers=${ctx().pendingToolCalls.size}, ctx.msgs=${context.messages.length}`);
@@ -1573,7 +1594,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Pi appends tool results to context and calls back. Extract this turn's results
 	// (everything after the last assistant message) and match against waiting MCP
 	// handlers. Results that arrive before their handler get queued in pendingResults.
-	if (resultCtx) {
+	if (resultCtx && !replacement) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
 		debug(`provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
@@ -1600,7 +1621,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// while the tool ran; otherwise end the turn so OMP waits for the next prompt.
 	// Uses its own output object: resetting ctx() here would wipe a live query's turn.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult") {
+	if (!replacement && lastMsg?.role === "toolResult") {
 		const parked = pendingTurnErrors.get(sessionKey);
 		pendingTurnErrors.delete(sessionKey);
 		debug(`provider: orphaned tool result, ${parked ? "delivering parked error" : "emitting end_turn"}`);
@@ -1624,8 +1645,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
 	//    background subagents can run concurrently with the parent query.
-	const isReentrant = activeQuery;
-	const queryCtx = isReentrant ? new QueryContext() : ctx();
+	const isReentrant = activeQuery && resultCtx !== ctx();
+	// Keep the old query's asynchronous finalizer isolated from the new stream.
+	const queryCtx = replacement || isReentrant ? new QueryContext() : ctx();
+	replacement?.();
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
@@ -1643,15 +1666,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.heldMs = 0;
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.historyRewriteAt = historyRewriteAt;
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	if (sideConversation) checkSideConversation(slot, sessionKey, context.messages.slice(0, -1));
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModelFor(model), sessionKey);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModelFor(model), sessionKey, replacement !== undefined);
 	if (sideConversation) sideConversationMessages.set(sessionKey, messageFingerprints(context.messages));
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
-	let promptText = extractUserPrompt(context.messages) ?? "";
+	let promptText = extractUserPrompt(context.messages) ?? (replacement && lastMsgRole !== "user" ? "[continue]" : "");
 
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.
@@ -1760,6 +1784,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
+	let retired = false;
+	let mirrorId = resumeSessionId ?? syncResult.freshSessionId;
 	const accountObservationsSince = Date.now();
 	const sdkQuery = query({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
@@ -1781,6 +1807,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// Both are needed — interrupt alone lets the current API call finish.
 		void sdkQuery.interrupt().catch(() => {});
 		try { sdkQuery.close(); } catch {}
+	};
+	queryCtx.retire = () => {
+		retired = true;
+		// Close before releasing any MCP handler so the old process cannot issue
+		// another request with the discarded context.
+		try { (queryCtx.activeQuery as Query | null)?.close(); } catch {}
 	};
 	const onAbort = () => {
 		wasAborted = true;
@@ -1808,8 +1840,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx, stopForExtraUsage, turnMeter)
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => retired || wasAborted, queryCtx, stopForExtraUsage, turnMeter)
 		.then(async ({ capturedSessionId }) => {
+			mirrorId = capturedSessionId ?? mirrorId;
+			if (retired) return;
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// --- Abort detection in normal completion path ---
@@ -1878,7 +1912,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 					const contMeter = newTurnMeter("continuation");
 					try {
-						const { capturedSessionId: contSid } = await consumeQuery(contQuery, customToolNameToPi, model, () => wasAborted, queryCtx, () => { try { contQuery.close(); } catch {} }, contMeter);
+						const { capturedSessionId: contSid } = await consumeQuery(contQuery, customToolNameToPi, model, () => retired || wasAborted, queryCtx, () => { try { contQuery.close(); } catch {} }, contMeter);
+						if (retired) return;
 						const sid = contSid ?? slot.s?.sessionId;
 						if (sid) {
 							slot.s = { sessionId: sid, cursor: slot.s?.cursor ?? 0, cwd };
@@ -1894,6 +1929,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			} finally {
 				queryCtx.activeQuery = sdkQuery;
 			}
+			if (retired) return;
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
 				debug("provider: clearing activeQuery before final stream completion");
@@ -1902,6 +1938,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		})
 		.catch((error) => {
+			if (retired) return;
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			const aborted = wasAborted || Boolean(options?.signal?.aborted);
 			if ((aborted || queryCtx.extraUsageBlocked) && slot.s) {
@@ -1946,10 +1983,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			activeQueryContexts.delete(queryCtx);
 			promptStream.end();
+			queryCtx.retire = undefined;
 			if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
 			queryCtx.pendingSteerUuids.clear();
 			sdkQuery.close();
-			if (ephemeral && slot.s) {
+			if (retired && mirrorId) {
+				try { deleteSession(mirrorId, cwd, process.env.CLAUDE_CONFIG_DIR); } catch (e) { debug("provider: could not delete retired mirror", e); }
+			} else if (!retired && ephemeral && slot.s) {
 				deleteSession(slot.s.sessionId, slot.s.cwd, process.env.CLAUDE_CONFIG_DIR);
 				debug(`provider: dropped side-request mirror ${slot.s.sessionId.slice(0, 8)} (${sessionKey})`);
 				slot.s = null;

@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- When OMP compacts during a tool call, the bridge now resumes from the compacted
+  history instead of continuing the Claude Code query with the old context.
+  The tool results and any steering messages carry over without rerunning tools.
+- Cache warming skips unfinished or invalidated mirrors rather than sending
+  another request with stale context.
+
 ## [0.11.4] - 2026-11-20
 
 ### Fixed
