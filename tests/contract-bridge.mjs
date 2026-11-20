@@ -1,6 +1,7 @@
 // Offline SDK-boundary checks: real bridge registration, routing and stream consumption.
 // The SDK query boundary is replaced so these never contact Anthropic or spend usage.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mock } from "bun:test";
@@ -17,13 +18,14 @@ const queries = [];
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 	createSdkMcpServer,
 	query({ options, prompt }) {
-		const batch = messages;
+		const closed = Promise.withResolvers();
+		const batch = typeof messages === "function" ? messages(closed.promise) : messages;
 		const call = { options, closed: false, delivered: [], input: prompt };
 		queries.push(call);
 		return {
 			async *[Symbol.asyncIterator]() {
 				if (typeof prompt !== "string") call.input = (await prompt[Symbol.asyncIterator]().next()).value?.message.content;
-				for (const message of batch) {
+				for await (const message of batch) {
 					if (call.closed) return;
 					call.delivered.push(message.type);
 					yield message;
@@ -31,7 +33,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 			},
 			accountInfo: async () => ({}),
 			interrupt: async () => {},
-			close() { call.closed = true; },
+			close() { call.closed = true; closed.resolve(); },
 		};
 	},
 }));
@@ -161,6 +163,52 @@ assert.equal(afterBlock.stopReason, "stop", "a prior Extra Usage stop must not p
 assert.equal(afterBlock.errorMessage, undefined);
 assert.equal(afterBlock.content.map((block) => block.text ?? "").join(""), "PLAN AVAILABLE AGAIN");
 console.log("ok   fresh queries recover from previous limit, upstream and Extra Usage errors");
+
+// OMP compacts between a tool call and its result. Claude must see the new
+// context, not keep growing the SDK query that issued the tool call.
+{
+	const { sessionPath } = await import("../src/session-extend.ts");
+	const options = { sessionId: "compact-during-tool", cwd: agentDir };
+	const ancient = { role: "user", content: "OLD HISTORY TO DISCARD", timestamp: 1 };
+	const start = { ...context, messages: [ancient, { role: "user", content: "START TOOL CALL", timestamp: 2 }] };
+	messages = async function* (closed) {
+		yield { type: "assistant", message: { content: [
+			{ type: "tool_use", id: "toolu_first", name: "mcp__custom-tools__read", input: {} },
+			{ type: "tool_use", id: "toolu_last", name: "mcp__custom-tools__read", input: {} },
+		] } };
+		await closed;
+		throw new Error("retired process exited");
+	};
+	const call = await registered.streamSimple(model, start, options).result();
+	assert.equal(call.stopReason, "toolUse");
+	const oldQuery = queries.at(-1);
+	const warming = await registered.streamSimple(model, start, { ...options, maxTokens: 1 }).result();
+	assert.equal(warming.stopReason, "error", "an unfinished mirror cannot be warmed");
+	assert.equal(queries.at(-1), oldQuery, "do not send a Claude request to warm an unfinished mirror");
+	for (const handler of parent.extensions[0].handlers.get("session_compact")) {
+		await handler({ type: "session_compact", fromExtension: false }, { sessionManager: { getSessionId: () => options.sessionId } });
+	}
+	const compacted = { role: "user", content: "COMPACTED HISTORY", attribution: "agent", historyRewriteAt: 2, timestamp: 3 };
+	const result = (id, text) => ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text }], timestamp: 3 });
+	const steer = { role: "user", content: "KEEP THIS STEER", timestamp: 4 };
+	const rewritten = { ...context, messages: [compacted, call, result("toolu_first", "FIRST RESULT"), steer, result("toolu_last", "LAST RESULT")] };
+	messages = [assistant("CONTINUED"), success("CONTINUED")];
+	const continued = registered.streamSimple(model, rewritten, options);
+	assert.equal(oldQuery.closed, true, "must not hand results back to the SDK query with stale history");
+	const newQuery = queries.at(-1);
+	assert.ok(newQuery.options.resume, "resume a mirror built from the compacted context");
+	assert.notEqual(newQuery.options.resume, oldQuery.options.resume, "the old process may still be writing");
+	assert.equal((await continued.result()).content[0]?.text, "CONTINUED");
+	const mirror = readFileSync(sessionPath(newQuery.options.resume, options.cwd), "utf8");
+	assert.match(mirror, /COMPACTED HISTORY/);
+	assert.match(mirror, /FIRST RESULT/);
+	assert.match(mirror, /LAST RESULT/);
+	assert.match(mirror, /KEEP THIS STEER/);
+	assert.doesNotMatch(mirror, /no tool result recorded/);
+	assert.doesNotMatch(mirror, /OLD HISTORY TO DISCARD/);
+	await new Promise(setImmediate);
+}
+console.log("ok   in-turn compaction replaces the live SDK query and retains every tool result");
 
 const oneShot = await run([overage, assistant("must not continue"), success("must not continue")], { ...context, tools: [] });
 assert.equal(oneShot.stopReason, "error");

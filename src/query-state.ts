@@ -18,6 +18,10 @@ export interface PendingToolCall {
 export class QueryContext {
 	// Query-scoped (fully isolated per query)
 	activeQuery: unknown | null = null;
+	/** Newest OMP history rewrite represented in this SDK query. */
+	historyRewriteAt = 0;
+	/** Stop this SDK query without ending OMP's turn, before replacing its history. */
+	retire: (() => void) | undefined;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
 	pendingToolCalls = new Map<string, PendingToolCall>();
