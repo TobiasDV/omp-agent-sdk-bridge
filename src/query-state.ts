@@ -22,6 +22,8 @@ export class QueryContext {
 	historyRewriteAt = 0;
 	/** Stop this SDK query without ending OMP's turn, before replacing its history. */
 	retire: (() => void) | undefined;
+	/** The session file this query resumed, whose clean point advances at each tool round. */
+	mirrorSessionId: string | undefined;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
 	pendingToolCalls = new Map<string, PendingToolCall>();
