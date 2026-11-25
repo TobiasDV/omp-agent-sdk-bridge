@@ -42,8 +42,10 @@ import { instructionReader, INSTRUCTION_READ_TOOL } from "./instruction-reader.j
 
 // OMP 19.2 replaced pi-tui: `Text` is gone and renderers return rows objects instead.
 // The width helpers exist only on 19.2+, so their absence selects the older `Text` path.
-const WIDTH_MODULE: string = "@oh-my-pi/pi-tui/text/width";
-const widthHelpers: { wrap?: (text: string, width: number) => string[] } = await import(WIDTH_MODULE).catch(() => ({}));
+// The specifier must stay a string literal: OMP maps only literal imports of its own
+// packages to the copy inside its binary, so a computed one fails to resolve there.
+// @ts-ignore -- the module is new in OMP 19.2, newer than the pi-tui these types come from.
+const widthHelpers: { wrap?: (text: string, width: number) => string[] } = await import("@oh-my-pi/pi-tui/text/width").catch(() => ({}));
 
 function textBlock(text: string) {
 	const wrap = widthHelpers.wrap;
