@@ -6,7 +6,7 @@ import { anthropicModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-mode
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { createSdkMcpServer, query, type Query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
-import { Text } from "@oh-my-pi/pi-tui";
+import * as piTui from "@oh-my-pi/pi-tui";
 import { getAgentDir, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
 import { clearStreamingPartialJson, getStreamingPartialJson, kStreamingLastParseLen, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
@@ -39,6 +39,19 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { explainClaudeError, explainPlanLimit, isExtraUsage, isPlanLimitMessage, newRateLimitTracker, rateLimitNotice, type RateLimitInfo } from "./rate-limit.js";
 import { QueryMeter, appendLedger, detectMiss, formatReport, formatTokens, promptTokens, readLedger, summarizeLedger, tokensFromReport, type Fingerprint, type LedgerEntry, type PrevCall, type SyncPath } from "./usage-ledger.js";
 import { instructionReader, INSTRUCTION_READ_TOOL } from "./instruction-reader.js";
+
+// OMP 19.2 replaced pi-tui: `Text` is gone and renderers return rows objects instead.
+// The width helpers exist only on 19.2+, so their absence selects the older `Text` path.
+// The specifier must stay a string literal: OMP maps only literal imports of its own
+// packages to the copy inside its binary, so a computed one fails to resolve there.
+// @ts-ignore -- the module is new in OMP 19.2, newer than the pi-tui these types come from.
+const widthHelpers: { wrap?: (text: string, width: number) => string[] } = await import("@oh-my-pi/pi-tui/text/width").catch(() => ({}));
+
+function textBlock(text: string) {
+	const wrap = widthHelpers.wrap;
+	if (wrap) return { render: (width: number) => wrap(text, width) };
+	return new piTui.Text(text, 0, 0);
+}
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -2447,12 +2460,12 @@ export default async function (pi: ExtensionAPI) {
 				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 				text += theme.fg("muted", `"${lines.join("\n")}"`);
 				if (params.prompt.length > PREVIEW_MAX_CHARS || params.prompt.split("\n").length > PREVIEW_MAX_LINES) text += theme.fg("dim", " …");
-				return new Text(text, 0, 0);
+				return textBlock(text);
 			},
 			renderResult(result, { expanded, isPartial }, theme) {
 				if (isPartial) {
 					const status = result.content[0]?.type === "text" ? result.content[0].text : "working...";
-					return new Text(theme.fg("mdLink", "◉ Claude ") + theme.fg("muted", status), 0, 0);
+					return textBlock(theme.fg("mdLink", "◉ Claude ") + theme.fg("muted", status));
 				}
 
 				const details = result.details as { prompt?: string; executionTime?: number; actions?: string; error?: boolean } | undefined;
@@ -2477,7 +2490,7 @@ export default async function (pi: ExtensionAPI) {
 
 				}
 
-				return new Text(text, 0, 0);
+				return textBlock(text);
 			},
 			async execute(_id, params, signal, onUpdate, ctx) {
 				// Guard: circular delegation

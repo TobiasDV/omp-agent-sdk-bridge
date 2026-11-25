@@ -12,6 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The tool results and any steering messages carry over without rerunning tools.
 - Cache warming skips unfinished or invalidated mirrors rather than sending
   another request with stale context.
+- The extension loads again on OMP 19.2, which removed pi-tui's `Text` component;
+  the `AskClaude` tool's call and result render as wrapped rows there. Older OMP
+  versions keep the `Text` component.
 - Aborting a turn after several tool calls no longer re-writes the whole
   conversation to the prompt cache on the next turn. The bridge now keeps Claude
   Code's own records up to the latest tool round instead of only up to the
