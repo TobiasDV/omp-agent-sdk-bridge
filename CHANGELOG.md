@@ -17,10 +17,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   versions keep the `Text` component.
 - Aborting a turn after several tool calls no longer re-writes the whole
   conversation to the prompt cache on the next turn. The bridge now keeps Claude
-  Code's own records up to the latest tool round instead of only up to the
-  turn's start, so the next request still reads the cache the aborted turn wrote.
-  The usage ledger names a remaining miss after an abort instead of calling it
-  unexplained.
+  Code's own records through the latest tool round it has written instead of
+  only up to the turn's start, so the next request still reads the cache the
+  aborted turn wrote. The usage ledger names a remaining miss after an abort
+  instead of calling it unexplained.
 
 ## [0.11.4] - 2026-11-20
 

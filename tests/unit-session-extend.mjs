@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { bytesThroughToolUses, extendCleanSession, sessionFileBytes, sessionPath } from "../src/session-extend.ts";
+import { extendCleanSession, latestRoundOnDisk, sessionFileBytes, sessionPath } from "../src/session-extend.ts";
 import { convertPiMessages } from "../src/convert.ts";
 
 // A throwaway Claude config dir; sessionPath reads CLAUDE_CONFIG_DIR at call time.
@@ -121,13 +121,14 @@ const roundRecords = [
 const roundText = roundRecords.map((r) => JSON.stringify(r)).join("\n") + "\n";
 const throughToolUses = Buffer.byteLength(ccText + roundRecords.slice(0, 4).map((r) => JSON.stringify(r)).join("\n") + "\n");
 
-test("the clean point of a tool round ends on CC's last tool_use record, ignoring later and half-written records", () => {
-	writeCc(roundText + '{"type":"user","message":{"content":[{"type":"tool_use","id":"toolu_c"');
+test("a rollback keeps CC's records through the newest tool round it has written, ignoring half-written lines", () => {
+	const data = Buffer.from(ccText + roundText + '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_c"');
 	const from = Buffer.byteLength(ccText);
-	assert.equal(bytesThroughToolUses(sid, cwd, from, ["toolu_a", "toolu_b"]), throughToolUses);
-	assert.equal(bytesThroughToolUses(sid, cwd, from, ["toolu_b", "toolu_c"]), undefined, "toolu_c is only in a half-written line");
-	assert.equal(bytesThroughToolUses(sid, cwd, throughToolUses, ["toolu_a"]), undefined, "records before `from` are not searched");
-	assert.equal(bytesThroughToolUses(sid, cwd, Buffer.byteLength(ccText + roundText) + 1000, ["toolu_a"]), undefined);
+	const round = { cursor: 4, toolUseIds: ["toolu_a", "toolu_b"] };
+	const unwritten = { cursor: 6, toolUseIds: ["toolu_c"] };
+	assert.deepEqual(latestRoundOnDisk(data, from, [round, unwritten]), { round, bytes: throughToolUses }, "toolu_c is only in a half-written line");
+	assert.equal(latestRoundOnDisk(data, throughToolUses, [round]), undefined, "records before `from` are not searched");
+	assert.equal(latestRoundOnDisk(data, data.length + 1000, [round]), undefined);
 });
 
 test("after an abort at a tool round, CC's records for the round are kept and OMP's results answer them", () => {
@@ -142,7 +143,8 @@ test("after an abort at a tool round, CC's records for the round are kept and OM
 		{ role: "assistant", content: [] },
 	];
 	const result = extendCleanSession({
-		sessionId: sid, cursor: 6, cleanCursor: 4, cleanBytes: throughToolUses, needsRebuild: true, forceRotate: true,
+		sessionId: sid, cursor: 6, cleanCursor: 2, cleanBytes: Buffer.byteLength(ccText), needsRebuild: true, forceRotate: true,
+		toolRounds: [{ cursor: 4, toolUseIds: ["toolu_a", "toolu_b"] }, { cursor: 7, toolUseIds: ["toolu_unwritten"] }],
 	}, messages, cwd, (session, tail) => session.importMessages(convertPiMessages(tail).anthropicMessages));
 	assert.equal(result.keptRecords, ccRecords.length + 4);
 	const records = readFileSync(sessionPath(result.sessionId, cwd), "utf-8").trim().split("\n").map(JSON.parse);

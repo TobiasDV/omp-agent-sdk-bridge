@@ -10,7 +10,7 @@ import * as piTui from "@oh-my-pi/pi-tui";
 import { getAgentDir, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
 import { clearStreamingPartialJson, getStreamingPartialJson, kStreamingLastParseLen, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
-import { bytesThroughToolUses, extendCleanSession as _extendCleanSession, sessionFileBytes, sessionPath } from "./session-extend.js";
+import { extendCleanSession as _extendCleanSession, sessionFileBytes, sessionPath, type ToolRound } from "./session-extend.js";
 import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -257,15 +257,16 @@ interface SessionState {
 	forceRotate?: boolean;
 	// Byte length of the leading part of CC's JSONL that mirrors OMP's
 	// priors[0..cleanCursor) exactly as CC itself wrote it: measured when a query
-	// starts and again at each of its tool rounds, so it stays valid after that
-	// query is aborted or fails. A rebuild keeps these bytes verbatim and converts
-	// only what follows. Rebuilding from OMP's history alone can't reproduce the
-	// records CC adds on its own (resume placeholders, environment/date/output-style
-	// attachments) or its record format, so the rebuilt request diverged and every
-	// cached message after the divergence had to be written again. Unset after a
-	// history rewrite.
+	// starts, so it stays valid after that query is aborted or fails. A rebuild
+	// keeps these bytes verbatim, plus CC's records through the newest tool round
+	// of the query it has written (toolRounds), and converts only what follows.
+	// Rebuilding from OMP's history alone can't reproduce the records CC adds on
+	// its own (resume placeholders, environment/date/output-style attachments) or
+	// its record format, so the rebuilt request diverged and every cached message
+	// after the divergence had to be written again. Unset after a history rewrite.
 	cleanBytes?: number;
 	cleanCursor?: number;
+	toolRounds?: ToolRound[];
 	// Set when a query completed: the whole file is clean, including the final
 	// assistant message that OMP's next context carries after `cursor`.
 	completed?: boolean;
@@ -887,7 +888,7 @@ function syncSharedSession(
 		if (missed.length === 0 || trailingAssistantOnly) {
 			slot.s = {
 				...slot.s, cursor: priorMessages.length, cwd,
-				cleanBytes: sessionFileBytes(slot.s.sessionId, cwd), cleanCursor: priorMessages.length, completed: false,
+				cleanBytes: sessionFileBytes(slot.s.sessionId, cwd), cleanCursor: priorMessages.length, toolRounds: undefined, completed: false,
 			};
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${slot.s.sessionId.slice(0, 8)}, cursor=${slot.s.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${slot.s.sessionId} cursor=${slot.s.cursor}`);
@@ -981,28 +982,19 @@ function extendCleanSession(
 }
 
 /**
- * Move the clean point past the assistant message whose tool calls OMP is answering:
- * Claude Code has written it, and every earlier round of this query, in its own
- * format. A rollback after an abort then keeps the records Claude Code actually sent,
- * so the next request still reads the cache this query wrote. Converting the whole
- * query from OMP's messages instead diverged from those requests, and once the
- * converted tail ran past the API's 20-block cache lookback, nothing after the system
- * prompt was read.
+ * Note a tool round of the running query, so a rollback after an abort can keep
+ * Claude Code's records through it: see latestRoundOnDisk. Claude Code may not
+ * have written the round's records yet, so the file is only read on rollback.
  */
-function advanceCleanPoint(slot: SessionSlot, queryCtx: QueryContext, messages: Context["messages"], results: McpResult[]): void {
+function recordToolRound(slot: SessionSlot, queryCtx: QueryContext, messages: Context["messages"], results: McpResult[]): void {
 	const state = slot.s;
 	if (!state || state.sessionId !== queryCtx.mirrorSessionId || state.needsRebuild || state.completed) return;
 	if (state.cleanBytes === undefined || state.cleanCursor === undefined) return;
-	let cleanCursor = messages.length;
-	while (cleanCursor > 0 && messages[cleanCursor - 1].role !== "assistant") cleanCursor--;
-	const ids = results.map((r) => r.toolCallId).filter((id): id is string => Boolean(id));
-	if (cleanCursor <= state.cleanCursor || ids.length === 0) return;
-	const cleanBytes = bytesThroughToolUses(state.sessionId, state.cwd, state.cleanBytes, ids);
-	if (cleanBytes === undefined) {
-		debug(`advanceCleanPoint: tool_use records for ${ids.join(", ")} not in ${state.sessionId.slice(0, 8)} yet, keeping the clean point at ${state.cleanCursor}`);
-		return;
-	}
-	slot.s = { ...state, cleanBytes, cleanCursor };
+	let cursor = messages.length;
+	while (cursor > 0 && messages[cursor - 1].role !== "assistant") cursor--;
+	const toolUseIds = results.map((r) => r.toolCallId).filter((id): id is string => Boolean(id));
+	if (cursor <= state.cleanCursor || toolUseIds.length === 0) return;
+	slot.s = { ...state, toolRounds: [...(state.toolRounds ?? []), { cursor, toolUseIds }] };
 }
 
 // @internal
@@ -1657,7 +1649,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		if (recipe) recipe.lastMessage = context.messages[context.messages.length - 1];
 
 		if (slot.s) slot.s.cursor = context.messages.length;
-		advanceCleanPoint(slot, resultCtx, context.messages, allResults);
+		recordToolRound(slot, resultCtx, context.messages, allResults);
 		if (sideConversation) sideConversationMessages.set(sessionKey, messageFingerprints(context.messages));
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
